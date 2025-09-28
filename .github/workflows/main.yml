@@ -1,112 +1,116 @@
-name: Continues testing
+name: Kernel Build with KernelSU
 
 on:
   push:
-  pull_request:
+    branches:
+      - "**"
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      KBUILD_BUILD_USER: NATO66613
-      KBUILD_BUILD_HOST: KREMLIN
+
     steps:
-      - name: Checkout repository
+      - name: Checkout Kernel Source
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Set up ccache
-        uses: hendrikmuhs/ccache-action@v1.2
-        with:
-          create-symlink: true
-          key: kernel-build-cache
-          restore-keys: |
-            kernel-build-cache
-          max-size: '10G'
-
-      - name: Restore toolchain cache
-        id: restore-clang
-        uses: actions/cache/restore@v4
-        with:
-          path: /home/runner/r547379
-          key: clang-r547379
-
-      - name: Install build dependencies
+      - name: Setup Build Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex libelf-dev libncurses-dev libssl-dev unzip zip wget libarchive-tools
-          
-          ccache --show-stats
+          sudo apt-get install -y bc bison flex libssl-dev make \
+            gcc clang llvm lld git zip unzip wget curl build-essential \
+            python3 python3-pip ccache kmod
 
-      - name: Deploy Clang
-        if: steps.restore-clang.outputs.cache-hit != 'true'
+      - name: Setup Toolchain
         run: |
-          git clone https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r547379.git /home/runner/r547379 --depth=1
+          mkdir -p ~/toolchains
+          cd ~/toolchains
+          git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 --depth=1 gcc64
+          wget https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-18.04.tar.xz
+          tar -xf clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-18.04.tar.xz
+          mv clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-18.04 clang
 
-      - name: Save clang
-        if: steps.restore-clang.outputs.cache-hit != 'true'
-        id: cache-clang-save
-        uses: actions/cache/save@v4
-        with:
-          path: /home/runner/r547379
-          key: clang-r547379
-
-      - name: Build the kernel with `ccache`
+      - name: Detect Kernel Version
+        id: kver
         run: |
-          export CLANG_PATH=$HOME/r547379/bin
-          export PATH=${CLANG_PATH}:${PATH}
+          cd $GITHUB_WORKSPACE
+          KERNEL_VER=$(make O=out kernelversion)
+          echo "kernel_ver=$KERNEL_VER" >> $GITHUB_OUTPUT
 
-          # Generate default config
-          make LLVM=1 LLVM_IAS=1 CC="ccache clang" raphael_defconfig
-
-          # Disable module signature verification and enable modules
-          scripts/config --enable MODULES
-          scripts/config --disable MODULE_SIG
-          scripts/config --disable MODULE_SIG_ALL
-          scripts/config --disable CONFIG_MODULE_SIG_FORCE
-
-          # Optional: confirm changes
-          scripts/config --list | grep MODULE
-
-          # Build kernel
-          make LLVM=1 LLVM_IAS=1 CC="ccache clang" -j$(grep -c ^processor /proc/cpuinfo)
-
-          # Show ccache stats after build
-          ccache --show-stats
-          ccache --show-config
-        shell: bash
-
-      - name: Repack Kernel Artifacts
+      - name: Add KernelSU
         run: |
-          git clone --depth=1 https://github.com/SOVIET-ANDROID/AnyKernel3.git $HOME/AnyKernel3
-          cp out/arch/arm64/boot/Image.gz-dtb $HOME/AnyKernel3/
-          cp out/arch/arm64/boot/dtbo.img $HOME/AnyKernel3/
+          cd $GITHUB_WORKSPACE
+          git clone https://github.com/tiann/KernelSU ksu
+          cd ksu
+          git submodule update --init --recursive
+          if [ -d "next/patches/${{ steps.kver.outputs.kernel_ver }}" ]; then
+            git am next/patches/${{ steps.kver.outputs.kernel_ver }}/*
+          else
+            echo "⚠️ No matching KernelSU patch found for kernel version ${{ steps.kver.outputs.kernel_ver }}, applying core patch"
+            patch -p1 < next/kernel/ksu.diff || true
+          fi
 
-          # Determine branch name and commit hash (first 6 characters)
-          BRANCH=$(echo "${GITHUB_REF#refs/heads/}" | sed 's|/|-|g')
-          COMMIT_HASH=$(echo "$GITHUB_SHA" | cut -c1-6)
-          ZIP_NAME="${BRANCH}-${COMMIT_HASH}.zip"
-          echo $ZIP_NAME
-
-          # Export ZIP_NAME for later steps
-          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
-
-          # Move entire AnyKernel3 directory to workspace
-          mv "$HOME/AnyKernel3" "$GITHUB_WORKSPACE/AnyKernel3"
-
-          # Verify contents of AnyKernel3 in workspace
-          ls -lah $GITHUB_WORKSPACE/AnyKernel3
-        shell: bash
-
-      - name: Create kernel ZIP
+      - name: Build Kernel (O=out)
         run: |
-          cd $GITHUB_WORKSPACE/AnyKernel3
-          zip -r ../${ZIP_NAME} ./*
-          echo "Kernel zip created: ${ZIP_NAME}"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH=$HOME/toolchains/gcc64/bin:$HOME/toolchains/clang/bin:$PATH
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CC=clang
 
-      - name: Upload Kernel Artifact
+          cd $GITHUB_WORKSPACE
+
+          mkdir -p out
+
+          # Generate defconfig in out directory
+          make O=out raphael_defconfig
+
+          # Force-enable module configs
+          if [ -f ./scripts/config ]; then
+            ./scripts/config --file out/.config --set-val CONFIG_MODULES y || true
+            ./scripts/config --file out/.config --set-val CONFIG_MODULE_UNLOAD y || true
+            ./scripts/config --file out/.config --set-val CONFIG_MODVERSIONS y || true
+            ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG || true
+            ./scripts/config --file out/.config --disable CONFIG_MODULE_SIG_ALL || true
+            ./scripts/config --file out/.config --set-str CONFIG_MODULE_SIG_KEY "" || true
+            ./scripts/config --file out/.config --disable CONFIG_IMA || true
+            ./scripts/config --file out/.config --disable CONFIG_IMA_APPRAISE || true
+            ./scripts/config --file out/.config --disable CONFIG_LOCK_DOWN_LSM || true
+          else
+            sed -i 's/# CONFIG_MODULES is not set/CONFIG_MODULES=y/' out/.config || true
+            grep -q "CONFIG_MODULES=y" out/.config || echo "CONFIG_MODULES=y" >> out/.config
+            sed -i 's/# CONFIG_MODULE_UNLOAD is not set/CONFIG_MODULE_UNLOAD=y/' out/.config || true
+            grep -q "CONFIG_MODULE_UNLOAD=y" out/.config || echo "CONFIG_MODULE_UNLOAD=y" >> out/.config
+            sed -i 's/# CONFIG_MODVERSIONS is not set/CONFIG_MODVERSIONS=y/' out/.config || true
+            grep -q "CONFIG_MODVERSIONS=y" out/.config || echo "CONFIG_MODVERSIONS=y" >> out/.config
+            sed -i 's/CONFIG_MODULE_SIG=y/# CONFIG_MODULE_SIG is not set/' out/.config || true
+            sed -i 's/CONFIG_MODULE_SIG_ALL=y/# CONFIG_MODULE_SIG_ALL is not set/' out/.config || true
+            sed -i 's/CONFIG_IMA=y/# CONFIG_IMA is not set/' out/.config || true
+            sed -i 's/CONFIG_IMA_APPRAISE=y/# CONFIG_IMA_APPRAISE is not set/' out/.config || true
+            sed -i 's/CONFIG_LOCK_DOWN_LSM=y/# CONFIG_LOCK_DOWN_LSM is not set/' out/.config || true
+          fi
+
+          # Finalize config
+          make O=out olddefconfig
+
+          # Verify modules are enabled
+          grep -q "CONFIG_MODULES=y" out/.config || { echo "❌ CONFIG_MODULES not enabled!"; exit 1; }
+
+          # Build kernel + modules
+          make -j$(nproc) O=out
+          make -j$(nproc) O=out modules
+          make INSTALL_MOD_PATH=out/modules_install O=out modules_install || true
+
+      - name: Pack into AnyKernel3 ZIP
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3.git AnyKernel
+          cp out/arch/arm64/boot/Image.gz-dtb AnyKernel/
+          cp -r out/lib/modules AnyKernel/modules
+          cd AnyKernel
+          zip -r9 ../kernel-build.zip *
+
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ZIP_NAME }}  # Dynamic naming for artifact
-          path: ${{ github.workspace }}/${{ env.ZIP_NAME }}
+          name: kernel-build
+          path: kernel-build.zip
