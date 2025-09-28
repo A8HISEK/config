@@ -56,9 +56,20 @@ jobs:
         run: |
           export CLANG_PATH=$HOME/r547379/bin
           export PATH=${CLANG_PATH}:${PATH}
-          
-          # Use ccache explicitly
+
+          # Generate default config
           make LLVM=1 LLVM_IAS=1 CC="ccache clang" raphael_defconfig
+
+          # Disable module signature verification and enable modules
+          scripts/config --enable MODULES
+          scripts/config --disable MODULE_SIG
+          scripts/config --disable MODULE_SIG_ALL
+          scripts/config --disable CONFIG_MODULE_SIG_FORCE
+
+          # Optional: confirm changes
+          scripts/config --list | grep MODULE
+
+          # Build kernel
           make LLVM=1 LLVM_IAS=1 CC="ccache clang" -j$(grep -c ^processor /proc/cpuinfo)
 
           # Show ccache stats after build
@@ -88,8 +99,14 @@ jobs:
           ls -lah $GITHUB_WORKSPACE/AnyKernel3
         shell: bash
 
+      - name: Create kernel ZIP
+        run: |
+          cd $GITHUB_WORKSPACE/AnyKernel3
+          zip -r ../${ZIP_NAME} ./*
+          echo "Kernel zip created: ${ZIP_NAME}"
+
       - name: Upload Kernel Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ZIP_NAME }}  # Dynamic naming for artifact
-          path: ${{ github.workspace }}/AnyKernel3/
+          path: ${{ github.workspace }}/${{ env.ZIP_NAME }}
